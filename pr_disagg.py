@@ -173,9 +173,7 @@ def create_generator(n_hidden, hidden_size, leakyrelu_alpha=0.2):
     reshaped = tf.keras.layers.Reshape( (tres,n_features_cond))(x)
     # normalize to sum 1 per sample per gridpoint
     print(reshaped.shape)
-    # normalized = tf.keras.layers.Lambda(lambda x: tf.transpose(tf.transpose(x,(1,0,2)) / tf.reduce_sum(x, 1), (1,0,2)))(reshaped)
-    # HACK
-    normalized = reshaped
+    normalized = tf.keras.layers.Lambda(lambda x: tf.transpose(tf.transpose(x,(1,0,2)) / tf.reduce_sum(x, 1), (1,0,2)))(reshaped)
     flattened = tf.keras.layers.Flatten()(normalized)
     out = flattened
     generator = tf.keras.Model([gendata_in, noise_in], out)
@@ -218,6 +216,8 @@ config = {'disc_config':{'n_hidden':10, 'hidden_size':1024, 'leakyrelu_alpha':0.
 
 # with lr_gan and lr_disc 1e-3: generator wins immediately
 # with lr_gan 1e-4 and lr_disc 1e-3: no one wins, but no convergence either
+
+# other note: uninitialized network output has very little variance
 
 
 gen, disc, gan = create_networks(config)
