@@ -1,3 +1,8 @@
+#! /proj/bolinc/users/x_sebsc/anaconda3/envs/nn-svd-env/bin/python
+
+#SBATCH -A snic2019-1-2
+#SBATCH --time=03-00:00:00
+#SBATCH -N 1
 """
 
 developed with tensorflow 2.0
@@ -9,20 +14,30 @@ pip: tqdm
 good guide for GANs: https://medium.com/datadriveninvestor/generative-adversarial-network-gan-using-keras-ce1c05cfdfd3
 https://machinelearningmastery.com/how-to-develop-a-conditional-generative-adversarial-network-from-scratch/
 https://developers.google.com/machine-learning/gan/training
+https://towardsdatascience.com/10-lessons-i-learned-training-generative-adversarial-networks-gans-for-a-year-c9071159628
+https://github.com/eriklindernoren/Keras-GAN/blob/master/wgan/wgan.py
 """
-
-from tqdm import tqdm, trange
+import pickle
+import matplotlib
+matplotlib.use('agg')
+from tqdm.auto import tqdm, trange
 import xarray as xr
 import numpy as np
 import pandas as pd
 import tensorflow as tf
 from pylab import plt
 from dask.diagnostics import ProgressBar
+import os
 ProgressBar().register()
 
-inpath='/climstorage/sebastian/pr_disagg/inca/'
+plotdir='plots_main/'
+outdir='/proj/bolinc/users/x_sebsc/pr_disagg/trained_models/'
+os.system(f'mkdir -p {plotdir}')
+os.system(f'mkdir -p {outdir}')
+# inpath='/climstorage/sebastian/pr_disagg/inca/'
 # inpath='/home/s/sebsc/pfs/pr_disagg/inca'
 # inpath='/content/drive/My Drive/data/inca/'
+inpath='/proj/bolinc/users/x_sebsc/pr_disagg/inca/'
 
 startyear=2008
 endyear=2017
@@ -35,6 +50,15 @@ data = xr.open_mfdataset(ifiles)
 
 # select precipitation
 data = data['pr']
+
+
+conditional = False
+
+# HACK
+# select only a single gridpoint (with keeping size 1 dimensions)
+# data = data[:,10:11,10:11]
+
+# END HACK
 
 # load data
 data.load()
@@ -99,10 +123,9 @@ n_features_cond = conds.shape[1]
 n_features_y = y.shape[1]
 
 # split into train and test set
-# TODO: check whether this is correct
-fraction_train = 0.7
+fraction_train = 1.0
 fraction_test = 1-fraction_train
-fraction_valid = 0.3
+fraction_valid = 0
 n_train = int(nsamples*fraction_train* (1-fraction_valid)//1)
 n_valid = int(nsamples*fraction_train*fraction_valid//1)
 
@@ -125,20 +148,27 @@ for ilat in range(nlat):
 
 # neural network
 
-# 3 learning rate for discriminator
-lr_disc = 1e-4
-lr_gan = lr_disc
+# optimizer recommended by WGAN paper
+optimizer = tf.keras.optimizers.RMSprop(lr=0.00005)
 print(f'training on {n_train} samples')
 
 
-def create_discriminator(n_hidden, hidden_size, leakyrelu_alpha, drop_prob, lr_disc):
+def wasserstein_loss(y_true, y_pred):
+    # we use -1 for fake, and +1 for real labels
+    return tf.reduce_mean(y_true * y_pred)
 
-    gendata_in = tf.keras.layers.Input(shape=n_features_y)
-    conddata_in = tf.keras.layers.Input(shape=n_features_cond)
+
+def create_discriminator(n_hidden, hidden_size, leakyrelu_alpha, drop_prob):
+
+    sample_in = tf.keras.layers.Input(shape=n_features_y, name='sample_in')
+    conddata_in = tf.keras.layers.Input(shape=n_features_cond, name='cond_in')
     # these inputs dont have the same dimension. we need to scale up the conddata
     conddata_scaled = tf.keras.layers.Dense(n_features_y)(conddata_in)
 
-    merged = tf.keras.layers.Concatenate()([gendata_in,conddata_scaled])
+    if conditional:
+        merged = tf.keras.layers.Concatenate()([sample_in,conddata_scaled])
+    else:
+        merged = sample_in
     # main part of discriminator network
     # flexible number of hidden layers
     x = merged
@@ -146,55 +176,69 @@ def create_discriminator(n_hidden, hidden_size, leakyrelu_alpha, drop_prob, lr_d
         x = tf.keras.layers.Dense(hidden_size)(x)
         x = tf.keras.layers.LeakyReLU(leakyrelu_alpha)(x)
         x = tf.keras.layers.Dropout(drop_prob)(x)
-    out = tf.keras.layers.Dense(units=1, activation='sigmoid')(x)
-    discriminator = tf.keras.Model([gendata_in, conddata_in], out)
-    # the discriminator judges labels (real or fake), so the loss should be binary crossentropy
-    discriminator.compile(loss='binary_crossentropy', optimizer=tf.keras.optimizers.Adam(lr=lr_disc))
+    # WGAN needs linear output layer
+    out = tf.keras.layers.Dense(units=1, activation='linear')(x)
+    discriminator = tf.keras.Model([sample_in, conddata_in], out)
+    discriminator.compile(loss=wasserstein_loss, optimizer=optimizer)
     return discriminator
 
 
-def create_generator(n_hidden, hidden_size, leakyrelu_alpha=0.2):
+def per_gridpoint_softmax(x):
+
+    # x has dimension (batch_size,tres,ngridpoints) pr (batch_size,tres,ngridpoints)
+    exps = tf.exp(x)
+    # now normalize over tres dimension
+    norm = tf.reduce_sum(exps,1)  # this now has shape (batch_size,lat,lon)
+    # to align the shapes of norm and exps, we need to swap dimensions of exps, so that tres is first
+    # simplest is to wimply swap the first 2 dimensions
+    # tf.transpose needs the full permutation vectors to make this work for general ranks of x
+    perm = tf.concat([[1,0], tf.range(2, tf.rank(x))], 0)
+    exps = tf.transpose(exps, perm)
+    out = exps / norm
+    out = tf.transpose(out, perm)
+    return out
+
+
+def create_generator(n_hidden, hidden_size, latent_dim, leakyrelu_alpha=0.2):
 
     # inputs
-    gendata_in = tf.keras.layers.Input(shape=n_features_cond)
-    noise_in = tf.keras.layers.Input(shape=n_features_cond)
-    merged = tf.keras.layers.Concatenate()([gendata_in,noise_in])
+    cond_in = tf.keras.layers.Input(shape=n_features_cond, name='cond_in')
+    latent_in = tf.keras.layers.Input(shape=latent_dim, name='latent_in')
+    if conditional:
+        merged = tf.keras.layers.Concatenate()([cond_in, latent_in])
+    else:
+        merged = latent_in
     # flexible number of hidden layers
     x = merged
     for i in range(n_hidden):
         x = tf.keras.layers.Dense(hidden_size)(x)
         x = tf.keras.layers.LeakyReLU(leakyrelu_alpha)(x)
 
-    # a sigmoid activation function in the last layer of the generator ensures
-    # that the output is in [0,1] for every gridpoint
-    # with softmax, the sume over all gridpoints is 1
-    # what we in fact need is that for every gridpoint, the sum is 1
-    x = tf.keras.layers.Dense(units=n_features_y, activation='softmax')(x)
+    # last layer with per-gridpoint softmax, enures that
+    # output os always in [0,1], and that the sum for every gridpoint (sum over tres) is 1
+    x = tf.keras.layers.Dense(units=n_features_y)(x)
     reshaped = tf.keras.layers.Reshape( (tres,n_features_cond))(x)
     # normalize to sum 1 per sample per gridpoint
     print(reshaped.shape)
-    normalized = tf.keras.layers.Lambda(lambda x: tf.transpose(tf.transpose(x,(1,0,2)) / tf.reduce_sum(x, 1), (1,0,2)))(reshaped)
+    normalized = tf.keras.layers.Activation(per_gridpoint_softmax)(reshaped)
     flattened = tf.keras.layers.Flatten()(normalized)
     out = flattened
-    generator = tf.keras.Model([gendata_in, noise_in], out)
-    generator.compile(loss='binary_crossentropy', optimizer=tf.keras.optimizers.Adam()) # this optimizer
-    # is in fact never used, but we need to define an optimizer for compilation
+    generator = tf.keras.Model([cond_in, latent_in], out)
     return generator
 
 
 # define the combined generator and discriminator model, for updating the generator
-def create_gan(disc, gen, lr_gan):
+def create_gan(disc, gen):
     # get noise and condition inputs from generator model
-    gen_noise, gen_cond = gen.input
+    gen_cond, gen_latent = gen.input
     # get image output from the generator model
     gen_output = gen.output
     # connect  output and cond input from generator as inputs to discriminator
     gan_output = disc([gen_output, gen_cond])
     # define gan model as taking noise and cond and outputting a classification
-    model = tf.keras.Model([gen_noise, gen_cond], gan_output)
+    model = tf.keras.Model([gen_cond, gen_latent], gan_output)
     # compile model
-    opt = tf.keras.optimizers.Adam(lr=lr_gan, beta_1=0.5)
-    model.compile(loss='binary_crossentropy', optimizer=opt)
+    model.compile(loss=wasserstein_loss, optimizer=optimizer)
     return model
 
 
@@ -202,17 +246,18 @@ def create_networks(config):
 
     disc = create_discriminator(**config['disc_config'])
     gen = create_generator(**config['gen_config'])
-    gan = create_gan(disc, gen, config['lr_gan'])
-    gen.summary()
+    gan = create_gan(disc, gen)
     disc.summary()
     gan.summary()
 
     return gen, disc, gan
 
 
-config = {'disc_config':{'n_hidden':10, 'hidden_size':1024, 'leakyrelu_alpha':0.2, 'drop_prob':0.3, 'lr_disc':1e-3},
-          'gen_config':{'n_hidden':10, 'hidden_size':1024, 'leakyrelu_alpha':0.2,},
-          'lr_gan':2e-4}
+config = {'disc_config':{'n_hidden':10, 'hidden_size':1024, 'leakyrelu_alpha':0.2, 'drop_prob':0},
+          'gen_config':{'n_hidden':10, 'hidden_size':1024,'latent_dim':100, 'leakyrelu_alpha':0.2,}
+          }
+
+latent_dim = config['gen_config']['latent_dim']
 
 # with lr_gan and lr_disc 1e-3: generator wins immediately
 # with lr_gan 1e-4 and lr_disc 1e-3: no one wins, but no convergence either
@@ -231,11 +276,11 @@ tf.keras.utils.plot_model(gan,'gan.png')
 def generate_latent_points(latent_dim, n_samples):
     images, conds = dataset
     # generate points in the latent space
-    z_input = np.random.normal(size=(n_samples, latent_dim))
+    latent = np.random.normal(size=(n_samples, latent_dim))
     # randomly select conditions
     ix = np.random.randint(0, images.shape[0], n_samples)
     conds = conds[ix]
-    return [z_input, conds]
+    return [conds, latent]
 
 
 def generate_real_samples( n_samples):
@@ -245,70 +290,27 @@ def generate_real_samples( n_samples):
     ix = np.random.randint(0, images.shape[0], n_samples)
     # select images and labels
     X, labels = images[ix], conds[ix]
-    # generate class labels (1, indicating that these are real)
-    y = np.ones((n_samples, 1))
-    return [X, labels], y
+    return [X, labels]
 
 
 # use the generator to generate n fake examples, with class labels
 def generate_fake_samples(generator, n_samples):
     # generate points in latent space
-    z_input, cond_input = generate_latent_points(latent_dim, n_samples)
+    cond_in, latent_in = generate_latent_points(latent_dim, n_samples)
     # predict outputs
-    images = generator.predict([z_input, cond_input])
-    # create class labels (0, indicating that these are fake)
-    y = np.zeros((n_samples, 1))
-    return [images, cond_input], y
+    images = generator.predict([cond_in, latent_in])
+    return [images, cond_in]
 
 
-dataset = [y_train, conds_train]
-
-latent_dim = n_features_cond
-# train the generator and discriminator
-n_epochs=100
-n_batch=32
-assert(n_batch%2==0)
-bat_per_epo = int(dataset[0].shape[0] / n_batch)
-half_batch = int(n_batch / 2)
-# manually enumerate epochs
-for i in trange(n_epochs):
-    # enumerate batches over the training set
-    for j in trange(bat_per_epo):
-        # train discrmininator
-        disc.trainable = True
-        # get randomly selected 'real' samples
-        [X_real, labels_real], y_real = generate_real_samples(half_batch)
-        # generate 'fake' examples
-        [X_fake, labels_fake], y_fake = generate_fake_samples(gen, half_batch)
-        # combine  them (we update the discriminator in one go). shuffling is not necessary, since
-        # it is only a single batch (and thus would have no effect)
-        X = np.concatenate([X_fake, X_real])
-        labels = np.concatenate([labels_fake, labels_real])
-        _y = np.concatenate([y_fake, y_real])
-        # update discriminator model weights
-        d_loss = disc.train_on_batch([X, labels], _y)
-
-        # train generator
-        disc.trainable = False
-        # prepare points in latent space as input for the generator
-        [z_input, labels_input] = generate_latent_points(latent_dim, n_batch)
-        # create lables for the samples. even though these samples are fake, we use 1, because
-        # we are training the generator, not the discriminator, and we want to "fool" the discriminator
-        y_gan = np.ones((n_batch, 1))
-        # update the generator via the discriminator's error
-        g_loss = gan.train_on_batch([z_input, labels_input], y_gan)
-        # summarize loss on this batch
-        print('>%d, %d/%d, d1=%.3f,  g=%.3f' %
-              (i+1, j+1, bat_per_epo, d_loss, g_loss))
-
-        # TODO: ad noise to inputs 9as regularizatoin)
-
-
+def generate(cond):
+    latent = np.random.normal(size=(1, latent_dim))
+    cond = np.expand_dims(cond,0)
+    return  gen.predict([cond, latent])
 
 
 def plot_sample(cond,y):
 
-    plt.figure(figsize=(10,10))
+    plt.figure(figsize=(7,7))
     nplots = tres+1
     nrows = int(np.ceil(np.sqrt(nplots)))
     ncols = int(np.floor(np.sqrt(nplots)))
@@ -319,7 +321,7 @@ def plot_sample(cond,y):
     plt.title('dsum')
     y = y.reshape(tres,nlat,nlon)
     # y is precipitation fraction. scale it to precipitation
-    y = y * cond.reshape(nlat,nlon)
+    # y = y * cond.reshape(nlat,nlon)
     vmax = np.max(y)
     vmin = 0
     for i in  range(tres):
@@ -327,21 +329,91 @@ def plot_sample(cond,y):
         plt.imshow(y[i], vmax=vmax, vmin=vmin, cmap=plt.cm.Blues)
 
     plt.colorbar()
-    plt.tight_layout()
-plot_sample(conds_train[0], y_train[0])
-
+    plt.tight_layout(pad=0)
 
 
 def generate_and_plot(cond):
-    z_input = np.random.normal(size=(1, latent_dim))
-    cond = np.expand_dims(cond,0)
-    y = gen.predict([z_input, cond])
-
+    y = generate(cond)
     plot_sample(cond,y)
-
     return y
 
 
-generate_and_plot(conds_train[0])
+
+dataset = [y_train, conds_train]
+
+# train the generator and discriminator
+n_epochs=1000
+batch_size=128
+clip_value=0.01
+n_disc = 5
+bat_per_epo = int(dataset[0].shape[0] / batch_size)
+valid = np.ones((batch_size, 1))
+fake = -np.ones((batch_size, 1))
+
+hist = {'d_loss':[], 'g_loss':[]}
+# manually enumerate epochs
+for i in trange(n_epochs):
+    # enumerate batches over the training set
+    for j in trange(bat_per_epo):
+
+        for _ in range(n_disc):
+            # train discrmininator
+            disc.trainable = True
+            # get randomly selected 'real' samples
+            [X_real, labels_real] = generate_real_samples(batch_size)
+            # generate 'fake' examples
+            [X_fake, labels_fake]= generate_fake_samples(gen, batch_size)
+            # update discriminator model weights
+            # finding: the order of updating fake and real might be important! when first updating real,
+            # then the disc has reasonable output for real, but not for fake
+            # d_loss_fake = disc.train_on_batch([X_fake, labels_fake], fake)
+            # d_loss_real = disc.train_on_batch([X_real, labels_real], valid)
+            # d_loss = np.mean([d_loss_real, d_loss_fake])
+
+            X = np.concatenate([X_fake, X_real])
+            labels = np.concatenate([labels_fake, labels_real])
+            _y = np.concatenate([fake, valid])
+            # update discriminator model weights
+            d_loss = disc.train_on_batch([X, labels], _y)
+
+            # Clip discriminator weights
+            for l in disc.layers:
+                weights = l.get_weights()
+                weights = [np.clip(w, -clip_value, clip_value) for w in weights]
+                l.set_weights(weights)
+
+        # train generator
+        disc.trainable = False
+        # prepare points in latent space as input for the generator
+        [cond_in, latent_in] = generate_latent_points(latent_dim, batch_size)
+        # update the generator via the discriminator's error
+        g_loss = gan.train_on_batch([cond_in, latent_in], valid)
+        # summarize loss on this batch
+        std_batch = np.std(gen.predict([cond_in, latent_in]))
+        print(f'{i + 1}, {j + 1}/{bat_per_epo}, d_loss {d_loss}'+ \
+              f' g:{g_loss}, std:{std_batch}')#, d_fake:{d_loss_fake} d_real:{d_loss_real}')
+
+    hist['d_loss'].append(d_loss)
+    hist['g_loss'].append(g_loss)
+
+    pd.DataFrame(hist).to_csv('hist.csv')
+
+    for iplot in range(6):
+        generate_and_plot(conds_train[0])
+        plt.suptitle(f'{i:03d}_{iplot:02d}')
+        plt.savefig(f'{plotdir}/generated_{i:03d}_{iplot:02d}.png')
+    plt.figure()
+    for _ in range(200):
+        s = generate(conds_train[0])
+        s = s.reshape(tres, nlat, nlon)
+        plt.plot(s[:, 0, 0])
+
+    plt.savefig(f'{plotdir}/generated_one_gridpoint{i:03d}.png')
+
+    plt.close('all')
+    # save networks every 10th epoch (they are quite large)
+    if i % 10 ==0:
+        gen.save(f'{outdir}/gen_{i:04d}.h5')
+        disc.save(f'{outdir}/disc_{i:04d}.h5')
 
 
