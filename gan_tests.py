@@ -1,8 +1,3 @@
-#! /proj/bolinc/users/x_sebsc/anaconda3/envs/nn-svd-env/bin/python
-
-#SBATCH -A snic2019-1-2
-#SBATCH --time=03-00:00:00
-#SBATCH -N 1
 """
 
 developed with tensorflow 2.0
@@ -17,74 +12,30 @@ https://developers.google.com/machine-learning/gan/training
 https://towardsdatascience.com/10-lessons-i-learned-training-generative-adversarial-networks-gans-for-a-year-c9071159628
 https://github.com/eriklindernoren/Keras-GAN/blob/master/wgan/wgan.py
 """
-import pickle
-import matplotlib
-matplotlib.use('agg')
+
 from tqdm.auto import tqdm, trange
 import xarray as xr
 import numpy as np
 import pandas as pd
 import tensorflow as tf
 from pylab import plt
-from dask.diagnostics import ProgressBar
-import os
-ProgressBar().register()
-
-plotdir='plots_main/'
-outdir='/proj/bolinc/users/x_sebsc/pr_disagg/trained_models/'
-os.system(f'mkdir -p {plotdir}')
-os.system(f'mkdir -p {outdir}')
-# inpath='/climstorage/sebastian/pr_disagg/inca/'
-# inpath='/home/s/sebsc/pfs/pr_disagg/inca'
-# inpath='/content/drive/My Drive/data/inca/'
-inpath='/proj/bolinc/users/x_sebsc/pr_disagg/inca/'
-
-startyear=2008
-endyear=2017
-# endyear=2009
-ifiles = [f'{inpath}/INCA_RR{year}_schoettl.nc' for year in range(startyear, endyear+1)]
-tres = 24*4  # 15 mins
-tres_reduce = 4
-pr_thresh_daily = 5
-data = xr.open_mfdataset(ifiles)
-
-# select precipitation
-data = data['pr']
 
 
-conditional = False
+tres = 24
 
-# load data
-data.load()
-
-# due to inteprolation and dataproecessing, there can be slighlty negative precipitation
-# values
-# set negative values to 0. this can be easist done on the raw numpy array (via .values)
-data.values[data<0]=0
-# if wanted, reduce timeresolution
-if tres_reduce > 1:
-    data = data.resample(time=f'{tres_reduce*15}min').sum('time')
-    data = data[:-1]
-
-tres = tres // tres_reduce
-# compute daily sum
-dsum = data.resample(time='1D', label='right').sum('time')
-# the last values is based only on a single value, so we remove it
-if tres_reduce == 1:
-    dsum = dsum[:-1]
-assert(len(dsum)==len(data)//(tres))
-
-nsamples, nlat,nlon = dsum.shape
-#TODO: add temperature, and dayofyear as input
+nlat = 1
+nlon = 1
 n_channel = 1
+# create fake data
+nsamples=1000
+conds = np.ones((nsamples,nlat,nlon))
+data = np.zeros((nsamples,tres,nlat,nlon))
+# data[:,10,:,:] = 1 # works, learned after a single epoch
+data[:nsamples//2,[5,15],:,:] = 1
+data[nsamples//2:,[2,7],:,:] = 1
+reshaped = data
 
-# the target is the high-temp-resolution data.
-# for this, we have to reshape it. for every sample of dsum, we have tres samples
-# at this point, we also extract the array data form the DataArray
-reshaped = data.values.reshape((nsamples,tres,nlat,nlon))
-# to check that this is right, we also reshape the time, and inspect whether it is correct
-t_reshaped = data.time.values.reshape((nsamples,tres))
-# normalize by every gridpoint, for every sample individually
+
 fractions = reshaped.copy()
 for i in range(nsamples):
     fractions[i] = reshaped[i] / reshaped[i].sum(axis=0) # mean over tres
@@ -94,20 +45,7 @@ assert(~np.any(np.isnan(fractions)))
 assert(np.max(fractions)<=1)
 
 
-print(t_reshaped)
-assert(pd.to_datetime(t_reshaped[0,1])==t_reshaped[0,0]+pd.to_timedelta(f'{tres_reduce*15}min'))
-# select only days with precipitation above the desired threshold
-# we select the days were the dayilysum is above the threshold for at least one gridpoint
-idcs_precip_days = dsum.max(('x','y')) > pr_thresh_daily
-fractions = fractions[idcs_precip_days]
-dsum = dsum[idcs_precip_days]
 
-nsamples = len(dsum)
-assert(len(fractions)==nsamples)
-
-
-# the daily sum is the main input input (condition)
-conds = dsum.values
 y = fractions
 # flatten lat,lon and n_channel/tres into a single dimension
 conds = conds.reshape(len(conds),-1)
@@ -116,16 +54,10 @@ y = y.reshape(len(y),-1)
 n_features_cond = conds.shape[1]
 n_features_y = y.shape[1]
 
-# split into train and test set
-fraction_train = 1.0
-fraction_test = 1-fraction_train
-fraction_valid = 0
-n_train = int(nsamples*fraction_train* (1-fraction_valid)//1)
-n_valid = int(nsamples*fraction_train*fraction_valid//1)
-
-conds_train = conds[:n_train]
-y_train = y[:n_train]
-
+# for the synthetic test, we done do any test/train/validation split
+y_train = y
+conds_train = conds
+n_train = len(y_train)
 # normalize the condition data. for the moment it is only precipitation, and
 # this we normalize to max 1
 norm_scale = conds_train.max()
@@ -159,10 +91,7 @@ def create_discriminator(n_hidden, hidden_size, leakyrelu_alpha, drop_prob):
     # these inputs dont have the same dimension. we need to scale up the conddata
     conddata_scaled = tf.keras.layers.Dense(n_features_y)(conddata_in)
 
-    if conditional:
-        merged = tf.keras.layers.Concatenate()([sample_in,conddata_scaled])
-    else:
-        merged = sample_in
+    merged = tf.keras.layers.Concatenate()([sample_in,conddata_scaled])
     # main part of discriminator network
     # flexible number of hidden layers
     x = merged
@@ -198,10 +127,7 @@ def create_generator(n_hidden, hidden_size, latent_dim, leakyrelu_alpha=0.2):
     # inputs
     cond_in = tf.keras.layers.Input(shape=n_features_cond, name='cond_in')
     latent_in = tf.keras.layers.Input(shape=latent_dim, name='latent_in')
-    if conditional:
-        merged = tf.keras.layers.Concatenate()([cond_in, latent_in])
-    else:
-        merged = latent_in
+    merged = tf.keras.layers.Concatenate()([cond_in, latent_in])
     # flexible number of hidden layers
     x = merged
     for i in range(n_hidden):
@@ -332,11 +258,30 @@ def generate_and_plot(cond):
     return y
 
 
+def time_correlation(x, tlag=1):
+    nsamples = len(x)
+    x = np.reshape(x, (nsamples,tres,nlat,nlon))
+    tcorr_per_pixel = np.zeros((nsamples,nlat,nlon))
+    lower_idx = tlag
+    if tlag == 0:
+        upper_idx = None
+    elif tlag > 0:
+        upper_idx = -tlag
+    else:
+        raise ValueError()
+    for nn in range(nsamples):
+        for ii in range(nlat):
+            for jj in range(nlon):
+                tcorr_per_pixel[nn,ii,jj] = np.corrcoef(x[nn,:upper_idx,ii,jj], x[nn,lower_idx:,ii,jj])[0,1]
+    return np.mean(tcorr_per_pixel)
+
+
+assert(time_correlation(y, tlag=0)==1)
 
 dataset = [y_train, conds_train]
 
 # train the generator and discriminator
-n_epochs=1000
+n_epochs=100
 batch_size=128
 clip_value=0.01
 n_disc = 5
@@ -344,7 +289,7 @@ bat_per_epo = int(dataset[0].shape[0] / batch_size)
 valid = np.ones((batch_size, 1))
 fake = -np.ones((batch_size, 1))
 
-hist = {'d_loss':[], 'g_loss':[]}
+
 # manually enumerate epochs
 for i in trange(n_epochs):
     # enumerate batches over the training set
@@ -387,27 +332,19 @@ for i in trange(n_epochs):
         print(f'{i + 1}, {j + 1}/{bat_per_epo}, d_loss {d_loss}'+ \
               f' g:{g_loss}, std:{std_batch}')#, d_fake:{d_loss_fake} d_real:{d_loss_real}')
 
-    hist['d_loss'].append(d_loss)
-    hist['g_loss'].append(g_loss)
-
-    pd.DataFrame(hist).to_csv('hist.csv')
 
     for iplot in range(6):
         generate_and_plot(conds_train[0])
         plt.suptitle(f'{i:03d}_{iplot:02d}')
-        plt.savefig(f'{plotdir}/generated_{i:03d}_{iplot:02d}.png')
+        plt.savefig(f'generated_{i:03d}_{iplot:02d}.png')
     plt.figure()
     for _ in range(200):
         s = generate(conds_train[0])
         s = s.reshape(tres, nlat, nlon)
         plt.plot(s[:, 0, 0])
 
-    plt.savefig(f'{plotdir}/generated_one_gridpoint{i:03d}.png')
+    plt.savefig(f'generated_one_gridpoint{i:03d}.png')
 
     plt.close('all')
-    # save networks every 10th epoch (they are quite large)
-    if i % 10 ==0:
-        gen.save(f'{outdir}/gen_{i:04d}.h5')
-        disc.save(f'{outdir}/disc_{i:04d}.h5')
 
 

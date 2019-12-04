@@ -1,8 +1,3 @@
-#! /proj/bolinc/users/x_sebsc/anaconda3/envs/nn-svd-env/bin/python
-
-#SBATCH -A snic2019-1-2
-#SBATCH --time=03-00:00:00
-#SBATCH -N 1
 """
 
 developed with tensorflow 2.0
@@ -18,6 +13,8 @@ https://towardsdatascience.com/10-lessons-i-learned-training-generative-adversar
 https://github.com/eriklindernoren/Keras-GAN/blob/master/wgan/wgan.py
 """
 import pickle
+import json
+import sys
 import matplotlib
 matplotlib.use('agg')
 from tqdm.auto import tqdm, trange
@@ -30,10 +27,7 @@ from dask.diagnostics import ProgressBar
 import os
 ProgressBar().register()
 
-plotdir='plots_main/'
-outdir='/proj/bolinc/users/x_sebsc/pr_disagg/trained_models/'
-os.system(f'mkdir -p {plotdir}')
-os.system(f'mkdir -p {outdir}')
+
 # inpath='/climstorage/sebastian/pr_disagg/inca/'
 # inpath='/home/s/sebsc/pfs/pr_disagg/inca'
 # inpath='/content/drive/My Drive/data/inca/'
@@ -46,6 +40,27 @@ ifiles = [f'{inpath}/INCA_RR{year}_schoettl.nc' for year in range(startyear, end
 tres = 24*4  # 15 mins
 tres_reduce = 4
 pr_thresh_daily = 5
+
+
+# read in configs from command line
+
+config_in = json.loads(sys.argv[1])
+config = config_in['config']
+i_config = config_in['i_config']
+print(config_in)
+
+n_epochs = config_in['n_epochs']
+batch_size = config_in['batch_size']
+clip_value = config_in['clip_value']
+n_disc = config_in['n_disc']
+
+plotdir = f'plots_{i_config:04d}/'
+outdir = f'/proj/bolinc/users/x_sebsc/pr_disagg/trained_models_{i_config:04d}/'
+os.system(f'mkdir -p {plotdir}')
+os.system(f'mkdir -p {outdir}')
+
+pickle.dump(config,open(f'{outdir}/config.pkl','wb'))
+
 data = xr.open_mfdataset(ifiles)
 
 # select precipitation
@@ -75,7 +90,7 @@ if tres_reduce == 1:
 assert(len(dsum)==len(data)//(tres))
 
 nsamples, nlat,nlon = dsum.shape
-#TODO: add temperature, and dayofyear as input
+
 n_channel = 1
 
 # the target is the high-temp-resolution data.
@@ -247,9 +262,7 @@ def create_networks(config):
     return gen, disc, gan
 
 
-config = {'disc_config':{'n_hidden':10, 'hidden_size':1024, 'leakyrelu_alpha':0.2, 'drop_prob':0},
-          'gen_config':{'n_hidden':10, 'hidden_size':1024,'latent_dim':100, 'leakyrelu_alpha':0.2,}
-          }
+
 
 latent_dim = config['gen_config']['latent_dim']
 
@@ -261,9 +274,9 @@ latent_dim = config['gen_config']['latent_dim']
 
 gen, disc, gan = create_networks(config)
 
-tf.keras.utils.plot_model(gen,'gen.png')
-tf.keras.utils.plot_model(disc,'disc.png')
-tf.keras.utils.plot_model(gan,'gan.png')
+# tf.keras.utils.plot_model(gen,'gen.png')
+# tf.keras.utils.plot_model(disc,'disc.png')
+# tf.keras.utils.plot_model(gan,'gan.png')
 
 
 # generate points in latent space as input for the generator
@@ -336,10 +349,7 @@ def generate_and_plot(cond):
 dataset = [y_train, conds_train]
 
 # train the generator and discriminator
-n_epochs=1000
-batch_size=128
-clip_value=0.01
-n_disc = 5
+
 bat_per_epo = int(dataset[0].shape[0] / batch_size)
 valid = np.ones((batch_size, 1))
 fake = -np.ones((batch_size, 1))
@@ -358,11 +368,6 @@ for i in trange(n_epochs):
             # generate 'fake' examples
             [X_fake, labels_fake]= generate_fake_samples(gen, batch_size)
             # update discriminator model weights
-            # finding: the order of updating fake and real might be important! when first updating real,
-            # then the disc has reasonable output for real, but not for fake
-            # d_loss_fake = disc.train_on_batch([X_fake, labels_fake], fake)
-            # d_loss_real = disc.train_on_batch([X_real, labels_real], valid)
-            # d_loss = np.mean([d_loss_real, d_loss_fake])
 
             X = np.concatenate([X_fake, X_real])
             labels = np.concatenate([labels_fake, labels_real])
@@ -390,7 +395,7 @@ for i in trange(n_epochs):
     hist['d_loss'].append(d_loss)
     hist['g_loss'].append(g_loss)
 
-    pd.DataFrame(hist).to_csv('hist.csv')
+    pd.DataFrame(hist).to_csv(f'{plotdir}/hist.csv')
 
     for iplot in range(6):
         generate_and_plot(conds_train[0])
